@@ -19,6 +19,10 @@ struct common_ngram_mod_v2 {
 
     size_t get_n()        const;
     size_t get_used()     const;
+
+    // generation, bumped on every clear - lets callers detect that the
+    // table content was wiped and cursors into it are stale
+    uint64_t get_gen() const;
     size_t size()         const;
     size_t size_bytes()   const;
 
@@ -36,6 +40,8 @@ private:
     size_t n_;
     size_t used_ = 0;
     size_t max_used_;
+
+    uint64_t gen_ = 0;
 
     std::vector<slot> entries_;
 };

@@ -2079,6 +2079,14 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         // the last position in the prompt that was added to the ngram container
         size_t i_last = 0;
 
+        // NIKI: prompt seen by the previous begin(), used to detect the append
+        // case (same conversation, grown prompt) and index only new tokens
+        llama_tokens prev_prompt;
+
+        // NIKI: table gen seen by the previous begin() - a mismatch means the
+        // table was reset since and everything must be re-indexed
+        uint64_t prev_gen = 0;
+
         // length of the last drafted n-gram (number of tokens returned by draft)
         size_t n_draft_last = 0;
 
@@ -2117,15 +2125,6 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
             }
         }
 
-        if (!this->params.cache_file.empty()) {
-            LOG_INF("%s: loading ngram_mod cache from '%s'\n", __func__, this->params.cache_file.c_str());
-            if (mod.load(this->params.cache_file)) {
-                LOG_INF("%s: - loaded used=%zu/%zu (%.2f)\n", __func__, mod.get_used(), mod.size(), (double)mod.get_used()/(double)mod.size());
-            } else {
-                LOG_INF("%s: - no existing cache, starting fresh\n", __func__);
-            }
-        }
-
         sinfos.resize(n_seq);
     }
 
@@ -2142,20 +2141,66 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
         auto & sinfo = sinfos[seq_id];
 
-        sinfo.i_last = 0;
         sinfo.n_draft_last = 0;
         sinfo.n_accepted_last = 0;
 
         const size_t n = mod.get_n();
+
+        // NIKI: index only n-grams the table cannot have yet. sessions usually
+        // resend the whole context plus a new tail (append), but rollbacks or
+        // context edits change the tail instead. the common prefix with the
+        // previous prompt is already indexed, only the rest needs work. a
+        // table reset (see gen) invalidates everything. the delta is indexed
+        // fully and synchronously: deferring it would weaken the first
+        // drafts, which flips the MTP skip/active state and costs far more
+        // than it saves.
+        size_t start = 0;
+        const char * cause = "full";
+        if (!sinfo.prev_prompt.empty() && sinfo.prev_gen == mod.get_gen()) {
+            const llama_tokens & prev = sinfo.prev_prompt;
+            if (prompt.size() >= prev.size() &&
+                std::equal(prev.begin(), prev.end(), prompt.begin())) {
+                // append (or identical): only the new tail needs indexing
+                start = prev.size() > n ? prev.size() - n : 0;
+                cause = "append";
+            } else {
+                const auto mm = std::mismatch(prev.begin(), prev.end(), prompt.begin(), prompt.end());
+                const size_t len = (size_t)(mm.first - prev.begin());
+                if (len == prompt.size()) {
+                    // pure rollback: the new prompt is a prefix of the previous
+                    // one, everything is already indexed - nothing to do
+                    start = prompt.size() > n ? prompt.size() - n : 0;
+                    cause = "rollback";
+                } else {
+                    // divergent tail (rollback + new text, context edit):
+                    // re-index from the divergence point
+                    start = len > n ? len - n : 0;
+                    cause = "diverge";
+                }
+            }
+        }
+
+        const size_t prev_len = sinfo.prev_prompt.size();
+
+        sinfo.prev_prompt = prompt;
+        sinfo.prev_gen = mod.get_gen();
+
         if (prompt.size() < n) {
+            sinfo.i_last = 0;
+            SPC_TRC("ngram_mod begin: %s (prompt=%zu too short)\n", cause, prompt.size());
             return;
         }
 
-        for (size_t i = 0; i < prompt.size() - n; ++i) {
+        const size_t end = prompt.size() - n;
+
+        SPC_TRC("ngram_mod begin: %s start=%zu end=%zu (prompt=%zu prev=%zu)\n",
+                cause, start, end, prompt.size(), prev_len);
+
+        for (size_t i = start; i < end; ++i) {
             mod.add(prompt.data() + i);
         }
 
-        sinfo.i_last = prompt.size() - n;
+        sinfo.i_last = end;
 
         const double f = (double)mod.get_used() / (double)mod.size();
         SPC_TRC("ngram_mod occupancy = %zu/%zu (%.2f)\n", mod.get_used(), mod.size(), f);
@@ -2276,6 +2321,12 @@ struct common_speculative_impl_ngram_mod_v2 : public common_speculative_impl {
 
     struct seq_info {
         size_t i_last = 0;
+        // NIKI: prompt seen by the previous begin(), used to detect the append
+        // case (same conversation, grown prompt) and index only new tokens
+        llama_tokens prev_prompt;
+        // NIKI: table gen seen by the previous begin() - a mismatch means the
+        // table was reset since and everything must be re-indexed
+        uint64_t prev_gen = 0;
         size_t n_draft_last = 0;
         int n_accepted_last = 0;
     };
@@ -2287,7 +2338,7 @@ struct common_speculative_impl_ngram_mod_v2 : public common_speculative_impl {
             uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_NGRAM_MOD, n_seq)
         , params(params.ngram_mod)
-        , mod(params.ngram_mod.n_match, 16*1024*1024)
+        , mod(params.ngram_mod.n_match, 4*1024*1024)
         , verbose(std::getenv("LLAMA_TRACE") != nullptr) {
         static_assert(sizeof(llama_token) == sizeof(common_ngram_mod_v2::entry_t));
 
@@ -2327,20 +2378,66 @@ struct common_speculative_impl_ngram_mod_v2 : public common_speculative_impl {
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
         auto & sinfo = sinfos[seq_id];
 
-        sinfo.i_last = 0;
         sinfo.n_draft_last = 0;
         sinfo.n_accepted_last = 0;
 
         const size_t n = mod.get_n();
+
+        // NIKI: index only n-grams the table cannot have yet. sessions usually
+        // resend the whole context plus a new tail (append), but rollbacks or
+        // context edits change the tail instead. the common prefix with the
+        // previous prompt is already indexed, only the rest needs work. a
+        // table reset (see gen) invalidates everything. the delta is indexed
+        // fully and synchronously: deferring it would weaken the first
+        // drafts, which flips the MTP skip/active state and costs far more
+        // than it saves.
+        size_t start = 0;
+        const char * cause = "full";
+        if (!sinfo.prev_prompt.empty() && sinfo.prev_gen == mod.get_gen()) {
+            const llama_tokens & prev = sinfo.prev_prompt;
+            if (prompt.size() >= prev.size() &&
+                std::equal(prev.begin(), prev.end(), prompt.begin())) {
+                // append (or identical): only the new tail needs indexing
+                start = prev.size() > n ? prev.size() - n : 0;
+                cause = "append";
+            } else {
+                const auto mm = std::mismatch(prev.begin(), prev.end(), prompt.begin(), prompt.end());
+                const size_t len = (size_t)(mm.first - prev.begin());
+                if (len == prompt.size()) {
+                    // pure rollback: the new prompt is a prefix of the previous
+                    // one, everything is already indexed - nothing to do
+                    start = prompt.size() > n ? prompt.size() - n : 0;
+                    cause = "rollback";
+                } else {
+                    // divergent tail (rollback + new text, context edit):
+                    // re-index from the divergence point
+                    start = len > n ? len - n : 0;
+                    cause = "diverge";
+                }
+            }
+        }
+
+        const size_t prev_len = sinfo.prev_prompt.size();
+
+        sinfo.prev_prompt = prompt;
+        sinfo.prev_gen = mod.get_gen();
+
         if (prompt.size() < n) {
+            sinfo.i_last = 0;
+            SPC_TRC("ngram_mod begin: %s (prompt=%zu too short)\n", cause, prompt.size());
             return;
         }
 
-        for (size_t i = 0; i < prompt.size() - n; ++i) {
+        const size_t end = prompt.size() - n;
+
+        SPC_TRC("ngram_mod begin: %s start=%zu end=%zu (prompt=%zu prev=%zu)\n",
+                cause, start, end, prompt.size(), prev_len);
+
+        for (size_t i = start; i < end; ++i) {
             mod.add(prompt.data() + i);
         }
 
-        sinfo.i_last = prompt.size() - n;
+        sinfo.i_last = end;
 
         const double f = (double)mod.get_used() / (double)mod.size();
         LOG_INF("%s: ngram_mod occupancy = %zu/%zu (%.2f)\n", __func__, mod.get_used(), mod.size(), f);

@@ -49,6 +49,7 @@ common_ngram_mod::entry_t common_ngram_mod::get(const entry_t * tokens) const {
 }
 
 void common_ngram_mod::reset() {
+    gen++;
     std::fill(entries.begin(), entries.end(), EMPTY);
     used = 0;
 }
@@ -165,6 +166,10 @@ size_t common_ngram_mod::get_n() const {
 
 size_t common_ngram_mod::get_used() const {
     return used;
+}
+
+uint64_t common_ngram_mod::get_gen() const {
+    return gen;
 }
 
 size_t common_ngram_mod::size() const {

@@ -15,7 +15,7 @@ common_ngram_mod_v2::common_ngram_mod_v2(uint16_t n, size_t size)
     : n_(n)
     , entries_(size)
 {
-    max_used_ = entries_.size() * 9 / 10;
+    max_used_ = entries_.size() * 99 / 100;
 }
 
 uint64_t common_ngram_mod_v2::hash_key(const entry_t * tokens) const {
@@ -69,6 +69,7 @@ common_ngram_mod_v2::entry_t common_ngram_mod_v2::get(const entry_t * tokens) co
 }
 
 void common_ngram_mod_v2::clear() {
+    gen_++;
     std::fill(entries_.begin(), entries_.end(), slot{});
     used_ = 0;
 }
@@ -79,6 +80,10 @@ size_t common_ngram_mod_v2::get_n() const {
 
 size_t common_ngram_mod_v2::get_used() const {
     return used_;
+}
+
+uint64_t common_ngram_mod_v2::get_gen() const {
+    return gen_;
 }
 
 size_t common_ngram_mod_v2::size() const {

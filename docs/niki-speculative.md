@@ -58,6 +58,33 @@ Parameter explanation:
   restarts. On startup, the file is loaded; on shutdown, it is saved. Over time
   the cache accumulates patterns that match your editing style and project
 
+### Incremental Prompt Indexing
+
+Agent sessions re-send the whole context every turn, but usually only the tail
+is new. Instead of re-indexing the full prompt on every `begin()` (O(prompt)
+per turn, O(T^2) per session), both v1 and v2 compare the new prompt with the
+previous one per sequence and index only n-grams the table cannot have yet:
+- `append` (same conversation, grown prompt) -- only the new tail is indexed;
+- `rollback` (last message retracted, prompt got shorter) -- nothing is
+  indexed, everything is already in the table;
+- `diverge` (rollback + new text, context edit) -- re-indexed from the
+  divergence point;
+- `full` (new chat, slot reuse, or table reset since) -- full re-index,
+  exactly as before.
+
+The delta is indexed fully and synchronously. For append-only sessions the
+indexed set is identical, so drafts and the MTP skip/active dynamics are
+unaffected while `begin()` drops from O(prompt) to O(delta). A generation
+counter on the table (`get_gen()`) invalidates per-sequence cursors after any
+reset, so a wiped table self-heals via one full re-index instead of silently
+losing matches.
+
+Note: the delta is deliberately NOT capped/amortized. Weak early drafts are
+not a graceful degradation here: an empty ngram draft flips MTP from skipped
+to active, which replays its catch-up backlog through the draft model
+(`sync_ctx_dft`) and runs full draft-model decodes instead of staying skipped.
+That costs far more than the deferred inserts ever save.
+
 ### Combining with a Draft Model (MTP)
 
 ngram-mod-v2 can be combined with MTP (Multi-Token Prediction) for even better
